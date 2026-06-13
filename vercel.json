@@ -1,0 +1,13 @@
+{
+  "functions": {
+    "api/search.mjs": {
+      "maxDuration": 30
+    },
+    "api/stats.mjs": {
+      "maxDuration": 10
+    }
+  },
+  "rewrites": [
+    { "source": "/stats", "destination": "/api/stats" }
+  ]
+}
