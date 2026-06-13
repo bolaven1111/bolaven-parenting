@@ -1,14 +1,20 @@
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const root = join(__dirname, '..');
 
 const API_KEY = process.env.DEEPSEEK_API_KEY;
 const API_BASE = 'https://api.deepseek.com';
 
-// Token统计（内存级，重启会重置）
+// 启动时加载知识库（内嵌 bundle，部署零依赖外部文件）
+const KNOWLEDGE_BUNDLE = JSON.parse(
+  readFileSync(join(__dirname, 'knowledge-bundle.json'), 'utf-8')
+);
+const KNOWLEDGE_INDEX = JSON.parse(
+  readFileSync(join(__dirname, 'knowledge-index.json'), 'utf-8')
+);
+
 let tokenStats = [];
 let requestCount = 0;
 
@@ -35,11 +41,9 @@ export default async function handler(req, res) {
   requestCount++;
 
   try {
-    const index = JSON.parse(
-      readFileSync(join(root, 'knowledge', 'index.json'), 'utf-8')
-    );
+    const index = KNOWLEDGE_INDEX;
 
-    // 分类——找到最相关的章节
+    // 分类——找出最相关的章节
     const matched = await classifyQuestion(question.trim(), index);
     if (!matched) {
       return res.json({
@@ -49,14 +53,13 @@ export default async function handler(req, res) {
       });
     }
 
-    // 在所有书目录中查找对应文件
+    // 从 bundle 中查找对应文件内容
     let chapterContent = null;
     let foundBook = null;
     for (const book of index.books) {
-      const dirName = book.name;
-      const filePath = join(root, 'knowledge', dirName, matched.file);
-      if (existsSync(filePath)) {
-        chapterContent = readFileSync(filePath, 'utf-8');
+      const bundle = KNOWLEDGE_BUNDLE[book.name];
+      if (bundle && bundle[matched.file]) {
+        chapterContent = bundle[matched.file];
         foundBook = book;
         break;
       }
@@ -69,7 +72,6 @@ export default async function handler(req, res) {
     // 生成回答
     const answer = await generateAnswer(question.trim(), chapterContent, foundBook);
 
-    // 记录用量
     const elapsed = Date.now() - startTime;
     tokenStats.push({
       time: new Date().toISOString(),
@@ -93,7 +95,6 @@ export default async function handler(req, res) {
   }
 }
 
-/* 调用DeepSeek API */
 async function callDeepSeek(messages, model, temperature = 0.3) {
   const resp = await fetch(`${API_BASE}/v1/chat/completions`, {
     method: 'POST',
@@ -117,7 +118,6 @@ async function callDeepSeek(messages, model, temperature = 0.3) {
   return resp.json();
 }
 
-/* 第一步：分类——找出最相关的章节 */
 async function classifyQuestion(question, index) {
   const allChapters = index.books.flatMap(b => b.chapters);
 
@@ -153,7 +153,6 @@ async function classifyQuestion(question, index) {
   };
 }
 
-/* 第二步：基于章节内容生成回答 */
 async function generateAnswer(question, chapterContent, book) {
   const maxLen = 8000;
   const content = chapterContent.length > maxLen
@@ -194,7 +193,6 @@ async function generateAnswer(question, chapterContent, book) {
   };
 }
 
-/* Token用量统计 */
 export function getStats() {
   const totalInput = tokenStats.reduce((s, r) => s + (r.tokens?.prompt_tokens || 0), 0);
   const totalOutput = tokenStats.reduce((s, r) => s + (r.tokens?.completion_tokens || 0), 0);
