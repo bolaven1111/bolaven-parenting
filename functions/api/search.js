@@ -1,5 +1,5 @@
 // Cloudflare Pages Functions — 育儿大师搜索API v1.1
-// 支持双书选择 + 答案直截了当
+// 支持双书选择 + 多书合并回答 + 答案直截了当
 
 const API_BASE = 'https://api.deepseek.com';
 
@@ -25,7 +25,6 @@ async function getIndex(env, request) {
 export async function onRequest(context) {
   const { request, env } = context;
 
-  // CORS
   if (request.method === 'OPTIONS') {
     return new Response(null, {
       status: 204,
@@ -74,7 +73,7 @@ export async function onRequest(context) {
     const index = await getIndex(env, request);
     const bundle = await getBundle(env, request);
 
-    // 根据选书过滤索引
+    // 根据选书过滤
     let filteredBooks = index.books;
     if (book && book !== 'all') {
       filteredBooks = index.books.filter(b => b.name === book);
@@ -88,10 +87,16 @@ export async function onRequest(context) {
 
     const filteredIndex = { books: filteredBooks };
     const allChapters = filteredBooks.flatMap(b => b.chapters);
+    if (allChapters.length === 0) {
+      return new Response(JSON.stringify({ error: '所选书籍暂无内容' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-    // 分类——找最相关章节
-    const matched = await classifyQuestion(question.trim(), filteredIndex, apiKey);
-    if (!matched) {
+    // 找出最相关的章节（跨书时会找多本书各1章）
+    const matchedChapters = await classifyQuestion(question.trim(), filteredIndex, apiKey);
+    if (!matchedChapters || matchedChapters.length === 0) {
       return new Response(JSON.stringify({
         answer: '**这个问题暂时超出我的知识范围**，换个方式问问看？',
         sources: [],
@@ -101,31 +106,41 @@ export async function onRequest(context) {
       });
     }
 
-    // 找章节内容
-    let chapterContent = null;
-    let foundBook = null;
-    for (const bookObj of filteredBooks) {
-      const b = bundle[bookObj.name];
-      if (b && b[matched.file]) {
-        chapterContent = b[matched.file];
-        foundBook = bookObj;
-        break;
+    // 收集所有匹配章节的内容
+    let combinedContent = [];
+    let sources = [];
+    for (const match of matchedChapters) {
+      for (const bookObj of filteredBooks) {
+        const b = bundle[bookObj.name];
+        if (b && b[match.file]) {
+          const maxLen = 6000;
+          const content = b[match.file].length > maxLen
+            ? b[match.file].substring(0, maxLen) + '\n\n[内容较长，已截取关键部分]'
+            : b[match.file];
+          combinedContent.push({
+            bookName: bookObj.name,
+            chapterTitle: match.chapter.title,
+            content: content
+          });
+          sources.push(`${bookObj.name} - ${match.chapter.title}`);
+          break;
+        }
       }
     }
 
-    if (!chapterContent) {
-      return new Response(JSON.stringify({ error: '知识库文件未找到' }), {
+    if (combinedContent.length === 0) {
+      return new Response(JSON.stringify({ error: '知识库内容未找到' }), {
         status: 500,
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
     // 生成回答
-    const answer = await generateAnswer(question.trim(), chapterContent, foundBook, apiKey);
+    const answer = await generateAnswer(question.trim(), combinedContent, apiKey);
 
     return new Response(JSON.stringify({
       answer: answer.text,
-      sources: answer.sources,
+      sources: sources,
       tokens: answer.tokens
     }), {
       headers: { 'Content-Type': 'application/json' }
@@ -163,48 +178,58 @@ async function callDeepSeek(messages, model, apiKey, temperature = 0.3) {
   return resp.json();
 }
 
+/* 分类：找出最相关的章节（每本书1个） */
 async function classifyQuestion(question, index, apiKey) {
-  const allChapters = index.books.flatMap(b => b.chapters);
-  if (allChapters.length === 0) return null;
+  const books = index.books;
+  const results = [];
 
-  const chapterList = allChapters.map((c, i) =>
-    `${i + 1}. [${c.book_short}] ${c.title}`
-  ).join('\n');
+  for (const book of books) {
+    const chapters = book.chapters;
+    if (chapters.length === 0) continue;
 
-  const messages = [
-    {
-      role: 'system',
-      content: `选出最相关的1个章节编号。章节列表格式为「[书名] 标题」。只输出数字。`
-    },
-    {
-      role: 'user',
-      content: `问题：${question}\n\n章节：\n${chapterList}\n\n最相关章节编号：`
+    const chapterList = chapters.map((c, i) =>
+      `${i + 1}. ${c.title}`
+    ).join('\n');
+
+    const messages = [
+      {
+        role: 'system',
+        content: `你是一个育儿知识分类助手。从以下章节列表中选出最相关的**1个**章节编号。只输出数字，不要多余内容。`
+      },
+      {
+        role: 'user',
+        content: `问题：${question}\n\n《${book.name}》章节：\n${chapterList}\n\n最相关章节编号：`
+      }
+    ];
+
+    try {
+      const result = await callDeepSeek(messages, 'deepseek-v4-flash', apiKey, 0.1);
+      const text = result.choices[0].message.content;
+      const numbers = text.match(/\d+/g);
+      if (numbers) {
+        const idx = parseInt(numbers[0], 10) - 1;
+        if (idx >= 0 && idx < chapters.length) {
+          results.push({ file: chapters[idx].file, chapter: chapters[idx] });
+        }
+      }
+    } catch (e) {
+      console.error(`Classify error for ${book.name}:`, e);
     }
-  ];
+  }
 
-  const result = await callDeepSeek(messages, 'deepseek-v4-flash', apiKey, 0.1);
-  const text = result.choices[0].message.content;
-  const numbers = text.match(/\d+/g);
-  if (!numbers) return null;
-
-  const idx = parseInt(numbers[0], 10) - 1;
-  if (idx < 0 || idx >= allChapters.length) return null;
-
-  return {
-    file: allChapters[idx].file,
-    chapter: allChapters[idx]
-  };
+  return results.length > 0 ? results : null;
 }
 
-async function generateAnswer(question, chapterContent, book, apiKey) {
-  const maxLen = 8000;
-  const content = chapterContent.length > maxLen
-    ? chapterContent.substring(0, maxLen) + '\n\n[内容较长，已截取关键部分]'
-    : chapterContent;
-
-  const titleMatch = chapterContent.match(/^#\s+(.+)/m);
-  const chapterTitle = titleMatch ? titleMatch[1] : '育儿知识';
-  const bookName = book?.name || '育儿百科';
+/* 生成回答 */
+async function generateAnswer(question, combinedContent, apiKey) {
+  // 组装多书资料
+  let contextParts = [];
+  for (const item of combinedContent) {
+    contextParts.push(
+      `【来源：《${item.bookName}》- ${item.chapterTitle}】\n${item.content}`
+    );
+  }
+  const fullContext = contextParts.join('\n\n---\n\n');
 
   const messages = [
     {
@@ -216,11 +241,11 @@ async function generateAnswer(question, chapterContent, book, apiKey) {
 4. **重要提醒用** __下划线__ 标注（如需要立即就医的情况）
 5. **每条回答控制在5-8行以内**，简明扼要
 6. 严格基于提供的资料，不编造
-7. 末尾注明来源，格式：📖 来源：《书名》- 章节名`
+7. 如果有多本书的资料，综合各书观点回答，注明各来源`
     },
     {
       role: 'user',
-      content: `用户：${question}\n\n资料：\n${content}\n\n回答：`
+      content: `用户：${question}\n\n相关资料（可能来自多本书）：\n${fullContext}\n\n回答：`
     }
   ];
 
@@ -229,7 +254,6 @@ async function generateAnswer(question, chapterContent, book, apiKey) {
 
   return {
     text: answerText,
-    sources: [`${bookName} - ${chapterTitle}`],
     tokens: result.usage
   };
 }
